@@ -3,6 +3,7 @@ import * as maplibregl from 'maplibre-gl';
 import type { Map as MapLibreMap, GeoJSONSource } from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { useTrafficStore } from '../../store/trafficStore';
+import { useUIStore } from '../../store/uiStore';
 import type { RoadData, VehicleData, IncidentData } from '../../types';
 
 // 真实城市中心点（上海中心）
@@ -41,6 +42,23 @@ export default function CityMap() {
   // 缓存从矢量瓦片提取的真实道路几何
   const realRoadsRef = useRef<GeoJSON.Feature[]>([]);
   const snapshot = useTrafficStore((s) => s.snapshot);
+  const selectedIncidentId = useUIStore((s) => s.selectedIncidentId);
+  const focusRoadId = useUIStore((s) => s.focusRoadId);
+  // 记录已飞行定位到的事件 / 路段，避免每次快照刷新重复飞行
+  const flownIncidentRef = useRef<string | null>(null);
+  const flownRoadRef = useRef<string | null>(null);
+
+  /** 取真实道路几何上的一个点（按索引映射，与图层渲染保持一致） */
+  const coordForRoadIndex = (index: number, fallback: [number, number]): [number, number] => {
+    const realRoads = realRoadsRef.current;
+    if (realRoads.length === 0) return fallback;
+    const road = realRoads[index % realRoads.length];
+    const lineCoords =
+      road.geometry.type === 'MultiLineString'
+        ? (road.geometry as GeoJSON.MultiLineString).coordinates[0]
+        : (road.geometry as GeoJSON.LineString).coordinates;
+    return pointAlongLine(lineCoords, 0.5);
+  };
 
   // 从 openmaptiles 矢量源提取真实主干道路几何
   const refreshRealRoads = (map: MapLibreMap) => {
@@ -144,6 +162,20 @@ export default function CityMap() {
         },
       });
 
+      // 选中路段高亮（单独图层，避免与缩放表达式混用）
+      map.addLayer({
+        id: 'traffic-roads-highlight',
+        type: 'line',
+        source: 'traffic-roads',
+        filter: ['==', ['get', 'selected'], true],
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: {
+          'line-color': '#2377bb',
+          'line-width': ['interpolate', ['linear'], ['zoom'], 12, 7, 16, 16],
+          'line-opacity': 0.85,
+        },
+      });
+
       // 车辆点位
       map.addSource('traffic-vehicles', {
         type: 'geojson',
@@ -182,6 +214,36 @@ export default function CityMap() {
         },
       });
 
+      // 选中事件高亮圈（单独图层）
+      map.addLayer({
+        id: 'traffic-incidents-highlight',
+        type: 'circle',
+        source: 'traffic-incidents',
+        filter: ['==', ['get', 'selected'], true],
+        paint: {
+          'circle-radius': ['interpolate', ['linear'], ['zoom'], 12, 10, 16, 17],
+          'circle-color': 'rgba(35,119,187,0.15)',
+          'circle-stroke-color': '#2377bb',
+          'circle-stroke-width': 3,
+          'circle-pitch-alignment': 'map',
+        },
+      });
+
+      // 事件点击 → 选中并联动研判面板
+      map.on('click', 'traffic-incidents', (e) => {
+        const id = e.features?.[0]?.properties?.id as string | undefined;
+        if (!id) return;
+        const ui = useUIStore.getState();
+        ui.setSelectedIncidentId(id);
+        ui.setActiveTab('incident');
+      });
+      map.on('mouseenter', 'traffic-incidents', () => {
+        map.getCanvas().style.cursor = 'pointer';
+      });
+      map.on('mouseleave', 'traffic-incidents', () => {
+        map.getCanvas().style.cursor = '';
+      });
+
       refreshRealRoads(map);
       mapRef.current = map;
     });
@@ -216,8 +278,10 @@ export default function CityMap() {
           return {
             type: 'Feature',
             properties: {
+              id: simRoad.id,
               congestion: simRoad.congestion,
               color: congestionColor(simRoad.congestion),
+              selected: simRoad.id === focusRoadId,
             },
             geometry: rr.geometry,
           };
@@ -226,7 +290,12 @@ export default function CityMap() {
         // 真实道路尚未加载，回退到模拟器网格
         features = simRoads.map((r: RoadData) => ({
           type: 'Feature',
-          properties: { congestion: r.congestion, color: congestionColor(r.congestion) },
+          properties: {
+            id: r.id,
+            congestion: r.congestion,
+            color: congestionColor(r.congestion),
+            selected: r.id === focusRoadId,
+          },
           geometry: {
             type: 'LineString',
             coordinates: [toLngLat(r.from.x, r.from.y), toLngLat(r.to.x, r.to.y)],
@@ -282,14 +351,46 @@ export default function CityMap() {
           coords = toLngLat(inc.position.x, inc.position.y);
         }
         return {
-          type: 'Feature',
-          properties: { type: inc.type, severity: inc.severity, color: sevColor[inc.severity] || '#f87171' },
-          geometry: { type: 'Point', coordinates: coords },
-        } as GeoJSON.Feature;
+            type: 'Feature',
+            properties: {
+              id: inc.id,
+              type: inc.type,
+              severity: inc.severity,
+              color: sevColor[inc.severity] || '#f87171',
+              selected: inc.id === selectedIncidentId,
+            },
+            geometry: { type: 'Point', coordinates: coords },
+          } as GeoJSON.Feature;
       });
       incidentsSource.setData({ type: 'FeatureCollection', features });
     }
-  }, [snapshot]);
+  }, [snapshot, selectedIncidentId, focusRoadId]);
+
+  // 选中事件 → 飞行定位（仅在选中项变化时触发一次）
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !snapshot || !selectedIncidentId) return;
+    if (flownIncidentRef.current === selectedIncidentId) return;
+    const index = snapshot.incidents.findIndex((i) => i.id === selectedIncidentId);
+    if (index < 0) return;
+    flownIncidentRef.current = selectedIncidentId;
+    const inc = snapshot.incidents[index];
+    const coord = coordForRoadIndex(index, toLngLat(inc.position.x, inc.position.y));
+    map.flyTo({ center: coord, zoom: 15.6, duration: 1200, essential: true });
+  }, [selectedIncidentId, snapshot]);
+
+  // 聚焦路段 → 飞行定位
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !snapshot || !focusRoadId) return;
+    if (flownRoadRef.current === focusRoadId) return;
+    const index = snapshot.roads.findIndex((r) => r.id === focusRoadId);
+    if (index < 0) return;
+    flownRoadRef.current = focusRoadId;
+    const road = snapshot.roads[index];
+    const coord = coordForRoadIndex(index, toLngLat(road.from.x, road.from.y));
+    map.flyTo({ center: coord, zoom: 15.2, duration: 1200, essential: true });
+  }, [focusRoadId, snapshot]);
 
   return <div ref={containerRef} className="absolute inset-0 w-full h-full" />;
 }

@@ -22,15 +22,14 @@ export function LeftPanel() {
   return (
     <aside className="absolute left-4 top-[80px] z-20 w-[300px] flex flex-col gap-3">
       {/* 标题模块 */}
-      <div className="rounded-lg">
-        <h1 className="text-[50px] font-light text-textMain leading-tight">
+      <div className="glass-panel rounded-lg p-3">
+        <h1 className="text-[44px] font-normal text-textMain leading-tight tracking-wide">
           交通调度
           <br />
           管理系统
         </h1>
-        <p className="text-xs text-textLight mt-2 leading-relaxed">
-          全域交通韧性监测，识别需要主动干预的路段
-          资源与事件研判。
+        <p className="text-xs text-textMain/70 mt-2 leading-relaxed">
+          全域交通韧性监测，识别需要主动干预的路段与事件研判。
         </p>
       </div>
 
